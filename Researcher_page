@@ -1,0 +1,407 @@
+!pip install pdfplumber
+import requests
+import json
+import os
+import pdfplumber
+import numpy as np
+from datetime import datetime, timedelta
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.naive_bayes import MultinomialNB
+from transformers import pipeline
+from sentence_transformers import SentenceTransformer, util
+from bs4 import BeautifulSoup
+import gradio as gr
+
+# -------------------------------
+# Literature Recommendation (Semantic Scholar)
+# -------------------------------
+HISTORY_FILE = "search_history.json"
+
+# Load previous search history
+def load_history():
+    if os.path.exists(HISTORY_FILE):
+        with open(HISTORY_FILE, "r") as f:
+            return json.load(f)
+    return []
+
+# Save updated search history
+def save_history(history):
+    with open(HISTORY_FILE, "w") as f:
+        json.dump(history, f, indent=2)
+
+# Search Semantic Scholar API (fixed endpoint)
+def search_papers(query, limit=5):
+    url = "https://api.semanticscholar.org/graph/v1/paper/search"
+    params = {
+        "query": query,
+        "limit": limit,
+        "fields": "title,abstract,year,authors,url,openAccessPdf"
+    }
+    try:
+        response = requests.get(url, params=params, timeout=10)
+        if response.status_code == 200:
+            data = response.json()
+            if "data" in data:
+                return data["data"]
+        return []
+    except Exception as e:
+        return []
+
+# Rank results based on history
+def rank_with_history(results, history):
+    ranked = []
+    for paper in results:
+        score = 0
+        for past_query in history:
+            if past_query and isinstance(past_query, str):
+                if past_query.lower() in str(paper.get("title", "")).lower():
+                    score += 2
+                if past_query.lower() in str(paper.get("abstract", "")).lower():
+                    score += 1
+        ranked.append((score, paper))
+    ranked.sort(key=lambda x: x[0], reverse=True)
+    return [p for _, p in ranked]
+
+# Download paper PDF if available
+def download_paper(paper, folder="downloads"):
+    os.makedirs(folder, exist_ok=True)
+    pdf_info = paper.get("openAccessPdf")
+    pdf_url = pdf_info.get("url") if pdf_info else None
+    if not pdf_url:
+        return f"❌ No PDF available for: {paper.get('title')}"
+    try:
+        response = requests.get(pdf_url, stream=True, timeout=15)
+        if response.status_code == 200:
+            filename = paper.get('title', 'paper').replace("/", "_").replace(" ", "_")[:50] + ".pdf"
+            filepath = os.path.join(folder, filename)
+            with open(filepath, "wb") as f:
+                for chunk in response.iter_content(chunk_size=1024):
+                    if chunk:
+                        f.write(chunk)
+            return f"✅ Downloaded: {filename}"
+        else:
+            return f"⚠️ Could not download PDF for: {paper.get('title')}"
+    except Exception as e:
+        return f"❌ Error downloading: {e}"
+
+def literature_interface(query):
+    if not query.strip():
+        return "Error: Please enter a search query."
+    history = load_history()
+    results = search_papers(query, limit=10)
+    ranked_results = rank_with_history(results, history)
+    if not ranked_results:
+        return "No results found. Try different keywords."
+
+    display_text = ""
+    for i, paper in enumerate(ranked_results, 1):
+        authors = ", ".join([a.get('name', '') for a in paper.get('authors', [])])
+        title = paper.get('title', 'No title')
+        year = paper.get('year', 'Unknown')
+        url = paper.get('url', '')
+        abstract = str(paper.get('abstract', 'No abstract available.'))[:300] + "..."
+        display_text += f"{i}. {title} ({year})\nAuthors: {authors}\nURL: {url}\nAbstract: {abstract}\n---\n"
+
+    if query:
+        history.append(query)
+        save_history(history)
+    return display_text
+# -------------------------------
+# Research Paper Field Extractor
+# -------------------------------
+pipe = pipeline(
+    "text-generation",
+    model="google/flan-t5-base"
+)
+
+def extract_fields(pdf_path):
+    text = ""
+    with pdfplumber.open(pdf_path) as pdf:
+        for page in pdf.pages:
+            page_text = page.extract_text()
+            if page_text:
+                text += page_text + "\n"
+    text = text[:2000]
+    prompt = f"""
+    Extract the following fields from this research paper and format them clearly:
+    - Title
+    - Abstract summary
+    - Keywords
+    - Algorithms used
+    - Dataset names
+    - Results
+    - Limitations
+    - Conclusion
+    - Future enhancement
+    - DOI
+
+    Research Paper Text:
+    {text}
+    """
+    result = pipe(prompt, max_new_tokens=256)[0]["generated_text"]
+    return result.strip()
+
+# -------------------------------
+# Advanced Task Manager
+# -------------------------------
+class AdvancedTaskManager:
+    def __init__(self):
+        self.tasks = []
+        self.completed_tasks = []
+        self.task_history = []
+        self.vectorizer = TfidfVectorizer(max_features=100)
+        self.priority_classifier = MultinomialNB()
+        self.load_data()
+        self.train_priority_classifier()
+
+    def load_data(self):
+        if os.path.exists("tasks.json"):
+            with open("tasks.json", "r") as f:
+                self.tasks = [t for t in json.load(f) if t.get("status") == "Pending"]
+        if os.path.exists("completed_tasks.json"):
+            with open("completed_tasks.json", "r") as f:
+                self.completed_tasks = [t for t in json.load(f) if t.get("status") == "Completed"]
+        if os.path.exists("task_history.json"):
+            with open("task_history.json", "r") as f:
+                self.task_history = json.load(f)
+
+    def save_data(self):
+        with open("tasks.json", "w") as f:
+            json.dump(self.tasks, f, indent=2)
+        with open("completed_tasks.json", "w") as f:
+            json.dump(self.completed_tasks, f, indent=2)
+        with open("task_history.json", "w") as f:
+            json.dump(self.task_history, f, indent=2)
+
+    def clear_all_tasks(self):
+        self.tasks, self.completed_tasks, self.task_history = [], [], []
+        self.save_data()
+        self.train_priority_classifier()
+        return "All tasks and history cleared", *self.get_task_lists()
+
+    def train_priority_classifier(self):
+        if self.task_history:
+            X = [t["task"] for t in self.task_history]
+            y = [t["priority"] for t in self.task_history]
+            if len(set(y)) > 1:
+                X_vec = self.vectorizer.fit_transform(X)
+                self.priority_classifier.fit(X_vec, y)
+
+    def suggest_priority(self, task):
+        if not task:
+            return "Error: Please enter a task description", "", "", ""
+        X_vec = self.vectorizer.transform([task])
+        if hasattr(self.priority_classifier, 'classes_'):
+            predicted_priority = self.priority_classifier.predict(X_vec)[0]
+        else:
+            urgent_keywords = ["urgent", "critical", "deadline", "important"]
+            predicted_priority = 1 if any(kw in task.lower() for kw in urgent_keywords) else 3
+        predicted_priority = max(1, min(5, int(predicted_priority)))
+        return f"Suggested priority: {predicted_priority}", "", "", ""
+
+    def suggest_deadline(self, task):
+        if not task:
+            return "Error: Please enter a task description", "", "", ""
+        workload = self.calculate_workload()
+        task_length = len(task.split())
+        suggested_days = 7 + (workload // 2)
+        if task_length > 20:
+            suggested_days += 2
+        if any(kw in task.lower() for kw in ["urgent", "critical", "deadline"]):
+            suggested_days = max(1, suggested_days - 2)
+        suggested_date = (datetime.now() + timedelta(days=suggested_days)).strftime("%Y-%m-%d")
+        return f"Suggested due date: {suggested_date}", "", "", ""
+
+    def calculate_workload(self):
+        now = datetime.now()
+        two_weeks = now + timedelta(days=14)
+        return sum(1 for t in self.tasks if datetime.strptime(t["due_date"], "%Y-%m-%d") <= two_weeks and t.get("status") == "Pending")
+
+    def add_task(self, task, due_date, priority):
+        try:
+            if not due_date:
+                raise ValueError("Due date cannot be empty")
+            datetime.strptime(due_date, "%Y-%m-%d")
+            if not priority:
+                _, _, _, priority = self.suggest_priority(task)
+            else:
+                priority = int(priority)
+                if not 1 <= priority <= 5:
+                    raise ValueError(f"Priority must be 1-5 (got {priority})")
+            if not task:
+                raise ValueError("Task description cannot be empty")
+            new_task = {"task": task, "due_date": due_date, "priority": priority, "status": "Pending"}
+            self.tasks.append(new_task)
+            self.task_history.append({"task": task, "due_date": due_date, "priority": priority, "completion_date": None})
+            self.save_data()
+            self.train_priority_classifier()
+            return "Task added successfully", *self.get_task_lists()
+        except ValueError as e:
+            return f"Error: Invalid input: {str(e)}", *self.get_task_lists()
+
+    def mark_complete(self, task_index):
+        try:
+            task_index = int(task_index)
+            if task_index < 0 or task_index >= len(self.tasks):
+                return "Error: Invalid task index", "", "", ""
+            due_date = datetime.strptime(self.tasks[task_index]["due_date"], "%Y-%m-%d")
+            if due_date > datetime.now():
+                return "Error: Cannot complete before due date", "", "", ""
+            now_date = datetime.now().strftime("%Y-%m-%d")
+            task_to_complete = self.tasks.pop(task_index)
+            task_to_complete["status"] = "Completed"
+            self.completed_tasks.append(task_to_complete)
+            for hist_task in self.task_history:
+                if hist_task["task"] == task_to_complete["task"] and hist_task["completion_date"] is None:
+                    hist_task["completion_date"] = now_date
+            self.save_data()
+            self.train_priority_classifier()
+            return "Task marked as completed", *self.get_task_lists()
+        except Exception as e:
+            return f"Error: {str(e)}", *self.get_task_lists()
+
+    def delete_task(self, task_index):
+        try:
+            task_index = int(task_index)
+            if task_index < 0 or task_index >= len(self.tasks):
+                return "Error: Invalid task index", "", "", ""
+            self.tasks.pop(task_index)
+            self.save_data()
+            return "Task deleted successfully", *self.get_task_lists()
+        except Exception as e:
+            return f"Error: {str(e)}", *self.get_task_lists()
+
+    def get_task_lists(self):
+        pending_tasks = "\n".join([f"{t['task']} | Due: {t['due_date']} | Priority: {t['priority']} | Status: {t['status']}" for t in self.tasks if t.get("status") == "Pending"])
+        completed_tasks = "\n".join([f"{t['task']} | Due: {t['due_date']} | Priority: {t['priority']} | Status: {t['status']}" for t in self.completed_tasks if t.get("status") == "Completed"])
+        total = len(self.tasks) + len(self.completed_tasks)
+        percentage = (len(self.completed_tasks) / total * 100) if total > 0 else 0
+        progress = f"Progress: {percentage:.1f}% ({len(self.completed_tasks)}/{total} completed)"
+        return pending_tasks, completed_tasks, progress
+
+# -------------------------------
+# Advanced Writing Support
+# -------------------------------
+class AdvancedWritingSupport:
+    def __init__(self):
+        self.grammar_pipeline = None
+        self.sbert_model = None
+
+    def load_models(self):
+        if self.grammar_pipeline is None:
+            self.grammar_pipeline = pipeline("text2text-generation", model="vennify/t5-base-grammar-correction")
+        if self.sbert_model is None:
+            self.sbert_model = SentenceTransformer('all-MiniLM-L6-v2')
+
+    def improve_writing(self, input_text):
+        self.load_models()
+        if not input_text.strip():
+            return "Error: Enter input text"
+        corrected = self.grammar_pipeline(f"grammar: {input_text}", max_length=200, truncation=True)[0]['generated_text']
+        return f"Improved Text:\n{corrected}"
+
+    def check_plagiarism(self, input_text, source):
+        self.load_models()
+        if not input_text.strip() or not source.strip():
+            return "Error: Enter text and source"
+        if source.startswith("http"):
+            try:
+                headers = {"User-Agent": "Mozilla/5.0"}
+                response = requests.get(source, headers=headers, timeout=10)
+                response.raise_for_status()
+                soup = BeautifulSoup(response.text, 'html.parser')
+                source_text = soup.get_text(" ", strip=True)
+            except Exception as e:
+                return f"Error fetching URL: {str(e)}"
+        else:
+            source_text = source
+        embed_input = self.sbert_model.encode(input_text)
+        embed_source = self.sbert_model.encode(source_text)
+        similarity = util.cos_sim(embed_input, embed_source)[0][0].item()
+        result = f"Similarity Score: {similarity:.2f}\n"
+        if similarity > 0.8:
+            result += "High similarity - Potential plagiarism"
+        elif similarity > 0.5:
+            result += "Moderate similarity - Review suggested"
+        else:
+            result += "Low similarity - Likely original"
+        return result
+
+# -------------------------------
+# Initialize
+# -------------------------------
+task_manager = AdvancedTaskManager()
+writing_support = AdvancedWritingSupport()
+
+# -------------------------------
+# Gradio Unified Interface
+# -------------------------------
+with gr.Blocks() as demo:
+    gr.Markdown("# Unified Research, Literature Recommendation, Task & Writing Support Platform")
+    with gr.Tabs():
+        with gr.TabItem("Literature Recommendation"):
+            lit_query = gr.Textbox(label="Enter keywords")
+            lit_button = gr.Button("Search Papers")
+            lit_output = gr.Textbox(label="Search Results", lines=20)
+            lit_button.click(fn=literature_interface, inputs=lit_query, outputs=lit_output)
+
+        with gr.TabItem("Research Paper Extractor"):
+            pdf_input = gr.File(label="Upload Research Paper (PDF)", type="filepath")
+            pdf_output = gr.Textbox(label="Extracted Fields", lines=15)
+            pdf_button = gr.Button("Extract")
+            pdf_button.click(fn=extract_fields, inputs=pdf_input, outputs=pdf_output)
+
+        with gr.TabItem("Task Manager"):
+            task_input = gr.Textbox(label="Task Description")
+            due_date_input = gr.Textbox(label="Due Date (YYYY-MM-DD)")
+            priority_input = gr.Textbox(label="Priority (1-5)")
+            task_index = gr.Slider(label="Select Task Index", minimum=0, maximum=100, step=1, value=0)
+            action = gr.Radio(["Add Task", "Suggest Priority", "Suggest Deadline", "Mark Complete", "Delete Task", "Clear All Tasks"], label="Action")
+            task_button = gr.Button("Execute")
+            task_output = gr.Textbox(label="Task Output")
+            pending_tasks = gr.Textbox(label="Pending Tasks", lines=10)
+            completed_tasks = gr.Textbox(label="Completed Tasks", lines=10)
+            progress = gr.Textbox(label="Progress")
+
+            def task_manager_interface(task, due_date, priority, task_index, action):
+                if action == "Add Task":
+                    return task_manager.add_task(task, due_date, priority)
+                elif action == "Suggest Priority":
+                    return task_manager.suggest_priority(task)
+                elif action == "Suggest Deadline":
+                    return task_manager.suggest_deadline(task)
+                elif action == "Mark Complete":
+                    return task_manager.mark_complete(task_index)
+                elif action == "Delete Task":
+                    return task_manager.delete_task(task_index)
+                elif action == "Clear All Tasks":
+                    return task_manager.clear_all_tasks()
+                return "", "", "", ""
+
+            task_button.click(
+                fn=task_manager_interface,
+                inputs=[task_input, due_date_input, priority_input, task_index, action],
+                outputs=[task_output, pending_tasks, completed_tasks, progress]
+            )
+
+        with gr.TabItem("Writing Support"):
+            ws_input = gr.Textbox(label="Enter text", lines=10)
+            ws_source = gr.Textbox(label="Enter source text or URL (for plagiarism check)", lines=5)
+            ws_action = gr.Radio(["Improve Writing", "Check Plagiarism"], label="Choose Action")
+            ws_button = gr.Button("Execute")
+            ws_output = gr.Textbox(label="Output", lines=15)
+
+            def writing_interface(text, source, action):
+                if action == "Improve Writing":
+                    return writing_support.improve_writing(text)
+                elif action == "Check Plagiarism":
+                    return writing_support.check_plagiarism(text, source)
+                return "Select an action."
+
+            ws_button.click(
+                fn=writing_interface,
+                inputs=[ws_input, ws_source, ws_action],
+                outputs=ws_output
+            )
+
+demo.launch()
